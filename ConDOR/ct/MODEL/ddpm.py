@@ -102,7 +102,7 @@ class warmup_Dataset1D(Dataset):
         self.max_visits = 1
         for filename in os.listdir(os.path.join(self.dir, self.status+'_data')):
             data = torch.load(os.path.join(self.dir, self.status+'_data', filename))
-            data = data.unsqueeze(0).type(torch.float32) # num_channel = 1 # [1, v, 148]
+            data = data.unsqueeze(0).type(torch.float32)  # num_channel = 1 -> [1, v, num_node]
 
             n_visit = data.shape[1]
             if n_visit == 1:
@@ -163,6 +163,7 @@ class Dataset1D(Dataset):
         self.dir = args.dir
         self.classes = args.classes
         self.status = status # either 'train' or 'test'
+        self.num_node = int(args.num_node)
 
         self.min_age = args.age_min
         self.max_age = args.age_max
@@ -213,7 +214,7 @@ class Dataset1D(Dataset):
             diff = self.max_visits - n_visit
             mask = torch.ones(n_visit)
             if diff > 0:
-                zero_pad_x = torch.zeros(size=(1, diff, 148))
+                zero_pad_x = torch.zeros(size=(1, diff, self.num_node))
                 zero_pad_y = torch.zeros(size=(diff, self.classes))
                 zero_pad_a = torch.zeros(size=(diff,))
                 zero_pad_mask = torch.zeros(size=(diff,))
@@ -254,18 +255,24 @@ class Residual(nn.Module):
     def forward(self, x, *args, **kwargs):
         return self.fn(x, *args, **kwargs) + x
 
-def Upsample(idx, dim, dim_out = None):
-    if idx == 0:
-        return nn.Sequential(
-            nn.Upsample(size=(37,), mode = 'nearest'),
-            nn.Conv1d(dim, default(dim_out, dim), 3, padding = 1)
-        )
-    
+def encoder_level_start_lengths(num_node, num_resolutions):
+    """Spatial lengths at the start of each down block (matches Downsample/last Conv)."""
+    cur = num_node
+    starts = [cur]
+    for _ in range(num_resolutions - 1):
+        cur = (cur + 2 * 1 - 4) // 2 + 1
+        starts.append(cur)
+    return starts
+
+def Upsample(idx, dim, dim_out = None, target_size = None):
+    if exists(target_size):
+        up = nn.Upsample(size = (target_size,), mode = 'nearest')
     else:
-        return nn.Sequential(
-            nn.Upsample(scale_factor = 2, mode = 'nearest'),
-            nn.Conv1d(dim, default(dim_out, dim), 3, padding = 1)
-        )
+        up = nn.Upsample(scale_factor = 2, mode = 'nearest')
+    return nn.Sequential(
+        up,
+        nn.Conv1d(dim, default(dim_out, dim), 3, padding=1),
+    )
 
 def Downsample(dim, dim_out = None):
     return nn.Conv1d(dim, default(dim_out, dim), 4, 2, 1)
@@ -485,7 +492,8 @@ class Unet1D(nn.Module):
         attn_dim_head = 32,
         attn_heads = 4,
         n_classes = None,
-        max_visit = None 
+        max_visit = None,
+        num_node = None,
     ):
         super().__init__()
 
@@ -501,6 +509,9 @@ class Unet1D(nn.Module):
 
         dims = [init_dim, *map(lambda m: dim * m, dim_mults)]
         in_out = list(zip(dims[:-1], dims[1:]))
+        num_resolutions = len(in_out)
+        level_starts = encoder_level_start_lengths(num_node, num_resolutions) if exists(num_node) else None
+        up_target_sizes = list(reversed(level_starts[:-1])) if exists(level_starts) else None
 
         # time embeddings
 
@@ -526,7 +537,6 @@ class Unet1D(nn.Module):
 
         self.downs = nn.ModuleList([])
         self.ups = nn.ModuleList([])
-        num_resolutions = len(in_out)
 
         for ind, (dim_in, dim_out) in enumerate(in_out):
             is_last = ind >= (num_resolutions - 1)
@@ -555,11 +565,12 @@ class Unet1D(nn.Module):
 
         for ind, (dim_in, dim_out) in enumerate(reversed(in_out)):
             is_last = ind == (len(in_out) - 1)
+            up_tgt = up_target_sizes[ind] if exists(up_target_sizes) and not is_last else None
             self.ups.append(nn.ModuleList([
                 ResnetBlock(dim_out + dim_in + 2*cond_out, dim_out, time_emb_dim = time_dim),
                 ResnetBlock(dim_out + dim_in + cond_out, dim_out, time_emb_dim = time_dim),
                 Residual(PreNorm(dim_out, LinearAttention(dim_out))),
-                Upsample(ind, dim_out, dim_in) if not is_last else nn.Conv1d(dim_out, dim_in, 3, padding = 1)
+                Upsample(ind, dim_out, dim_in, target_size = up_tgt) if not is_last else nn.Conv1d(dim_out, dim_in, 3, padding = 1)
             ]))
 
         default_out_dim = channels * (1 if not learned_variance else 2)

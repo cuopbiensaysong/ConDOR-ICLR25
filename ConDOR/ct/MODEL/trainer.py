@@ -32,6 +32,9 @@ import wandb
 import pickle
 import pandas as pd
 import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(os.path.join(current_dir, '../../'))
@@ -45,6 +48,83 @@ ModelPrediction =  namedtuple('ModelPrediction', ['pred_noise', 'pred_x_start'])
 
 def exists(x):
     return x is not None
+
+def curve_tensor_to_wandb_chw(t):
+    """1D curve or [1,L] / [V,L] -> (C,H,W) for wandb.Image: [L]->(1,1,L), [1,L]->(1,1,L), [V,L]->(1,V,L)."""
+    x = t.detach()
+    if x.is_sparse:
+        x = x.to_dense()
+    x = x.float().cpu().contiguous()
+    if x.dim() == 1:
+        return x.unsqueeze(0).unsqueeze(0)
+    if x.dim() == 2:
+        return x.unsqueeze(0)
+    if x.dim() == 3:
+        if x.shape[0] != 1:
+            x = x[:1]
+        return x
+    raise ValueError(f'curve_tensor_to_wandb_chw: unsupported shape {tuple(t.shape)}')
+
+def make_curve_lineplot_figure(pred, gt=None, *, title='', line_label='pred'):
+    """Matplotlib line plot for [L], [V,L], or [1,V,L] tensors."""
+    p = pred.detach().float()
+    if p.dim() == 3 and p.shape[0] == 1:
+        p = p.squeeze(0)
+    p = p.cpu().numpy()
+    g = None
+    if exists(gt):
+        g = gt.detach().float()
+        if g.dim() == 3 and g.shape[0] == 1:
+            g = g.squeeze(0)
+        g = g.cpu().numpy()
+    if p.ndim == 1:
+        L = p.shape[0]
+        w = max(6, min(20, L / 8))
+        fig, ax = plt.subplots(figsize=(w, 3))
+        idx = np.arange(L)
+        ax.plot(idx, p, label=line_label, lw=1.2)
+        if g is not None:
+            g = np.asarray(g).reshape(-1)
+            if g.shape[0] == L:
+                ax.plot(idx, g, label='GT', lw=1.0, alpha=0.75)
+        ax.legend(loc='upper right')
+    elif p.ndim == 2:
+        V, L = p.shape
+        w = max(6, min(24, L / 8))
+        h = min(10, max(3.0, V * 0.4))
+        fig, ax = plt.subplots(figsize=(w, h))
+        idx = np.arange(L)
+        for v in range(V):
+            ax.plot(idx, p[v], label=f'{line_label} v{v}', lw=0.9, alpha=0.85)
+        if g is not None and g.ndim == 2 and g.shape == p.shape:
+            for v in range(V):
+                ax.plot(idx, g[v], '--', label=f'GT v{v}', lw=0.7, alpha=0.45)
+        ax.legend(loc='upper right', fontsize=min(9, max(6, 120 // max(V, 1))))
+    else:
+        raise ValueError(f'make_curve_lineplot_figure: expected [L], [V,L], or [1,V,L], got {p.shape}')
+    ax.set_xlabel('node / index')
+    ax.set_ylabel('value')
+    if title:
+        ax.set_title(title)
+    fig.tight_layout()
+    return fig
+
+def _squeeze_leading_channel(x):
+    """[1, L] or [1, V, N] -> [L] or [V, N]; leave [V, N] unchanged."""
+    t = x.detach().float()
+    if t.dim() >= 2 and t.shape[0] == 1:
+        t = t.squeeze(0)
+    return t
+
+def _gt_for_curve_plot(pred, test_x_first):
+    """Return GT tensor on same device/shape as pred when possible, else None."""
+    g = _squeeze_leading_channel(test_x_first)
+    p = pred.detach().float()
+    if g.shape == p.shape:
+        return g
+    if g.numel() == p.numel():
+        return g.reshape(p.shape)
+    return None
 
 def default(val, d):
     if exists(val):
@@ -165,6 +245,7 @@ class Dataset1D(Dataset):
         self.dir = args.dir
         self.classes = args.classes
         self.status = status # either 'train' or 'test'
+        self.num_node = int(args.num_node)
 
         self.min_age = args.age_min
         self.max_age = args.age_max
@@ -215,7 +296,7 @@ class Dataset1D(Dataset):
             diff = self.max_visits - n_visit
             mask = torch.ones(n_visit)
             if diff > 0:
-                zero_pad_x = torch.zeros(size=(1, diff, 148))
+                zero_pad_x = torch.zeros(size=(1, diff, self.num_node))
                 zero_pad_y = torch.zeros(size=(diff, self.classes))
                 zero_pad_a = torch.zeros(size=(diff,))
                 zero_pad_mask = torch.zeros(size=(diff,))
@@ -258,18 +339,24 @@ class Residual(nn.Module):
     def forward(self, x, *args, **kwargs):
         return self.fn(x, *args, **kwargs) + x
 
-def Upsample(idx, dim, dim_out = None):
-    if idx == 0:
-        return nn.Sequential(
-            nn.Upsample(size=(37,), mode = 'nearest'),
-            nn.Conv1d(dim, default(dim_out, dim), 3, padding = 1)
-        )
-    
+def encoder_level_start_lengths(num_node, num_resolutions):
+    """Spatial lengths at the start of each down block (matches Downsample/last Conv)."""
+    cur = num_node
+    starts = [cur]
+    for _ in range(num_resolutions - 1):
+        cur = (cur + 2 * 1 - 4) // 2 + 1
+        starts.append(cur)
+    return starts
+
+def Upsample(idx, dim, dim_out = None, target_size = None):
+    if exists(target_size):
+        up = nn.Upsample(size = (target_size,), mode = 'nearest')
     else:
-        return nn.Sequential(
-            nn.Upsample(scale_factor = 2, mode = 'nearest'),
-            nn.Conv1d(dim, default(dim_out, dim), 3, padding = 1)
-        )
+        up = nn.Upsample(scale_factor = 2, mode = 'nearest')
+    return nn.Sequential(
+        up,
+        nn.Conv1d(dim, default(dim_out, dim), 3, padding=1),
+    )
 
 def Downsample(dim, dim_out = None):
     return nn.Conv1d(dim, default(dim_out, dim), 4, 2, 1)
@@ -489,7 +576,8 @@ class Unet1D(nn.Module):
         attn_dim_head = 32,
         attn_heads = 4,
         n_classes = None,
-        max_visit = None
+        max_visit = None,
+        num_node = None,
     ):
         super().__init__()
 
@@ -505,6 +593,9 @@ class Unet1D(nn.Module):
 
         dims = [init_dim, *map(lambda m: dim * m, dim_mults)]
         in_out = list(zip(dims[:-1], dims[1:]))
+        num_resolutions = len(in_out)
+        level_starts = encoder_level_start_lengths(num_node, num_resolutions) if exists(num_node) else None
+        up_target_sizes = list(reversed(level_starts[:-1])) if exists(level_starts) else None
 
         # time embeddings
 
@@ -530,7 +621,6 @@ class Unet1D(nn.Module):
 
         self.downs = nn.ModuleList([])
         self.ups = nn.ModuleList([])
-        num_resolutions = len(in_out)
 
         for ind, (dim_in, dim_out) in enumerate(in_out):
             is_last = ind >= (num_resolutions - 1)
@@ -559,11 +649,12 @@ class Unet1D(nn.Module):
 
         for ind, (dim_in, dim_out) in enumerate(reversed(in_out)):
             is_last = ind == (len(in_out) - 1)
+            up_tgt = up_target_sizes[ind] if exists(up_target_sizes) and not is_last else None
             self.ups.append(nn.ModuleList([
                 ResnetBlock(dim_out + dim_in + 2*cond_out, dim_out, time_emb_dim = time_dim),
                 ResnetBlock(dim_out + dim_in + cond_out, dim_out, time_emb_dim = time_dim),
                 Residual(PreNorm(dim_out, LinearAttention(dim_out))),
-                Upsample(ind, dim_out, dim_in) if not is_last else nn.Conv1d(dim_out, dim_in, 3, padding = 1) 
+                Upsample(ind, dim_out, dim_in, target_size = up_tgt) if not is_last else nn.Conv1d(dim_out, dim_in, 3, padding = 1)
             ]))
 
         default_out_dim = channels * (1 if not learned_variance else 2)
@@ -1108,7 +1199,7 @@ class Trainer1D(object):
         self.model.OR_model.get_device(self.device) ### put OR_model onto designated GPUs
 
         self.results_folder = Path(results_folder)
-        self.results_folder.mkdir(exist_ok = True)
+        os.makedirs(self.results_folder, exist_ok=True)
 
         # step counter state
 
@@ -1263,8 +1354,12 @@ class Trainer1D(object):
                             if milestone == 1:
                                 fn = 'warmup_GT.png'
                                 torch.save(test_x, os.path.join(self.results_folder, fn))
-                                image = wandb.Image(test_x[0].unsqueeze(0), caption=fn, file_type="png") ## visualize first data ##########
+                                chw = curve_tensor_to_wandb_chw(test_x[0])
+                                image = wandb.Image(chw, caption=fn, file_type="png")
                                 wandb.run.log({"test sample": [image]})
+                                fig_gt = make_curve_lineplot_figure(test_x[0], gt=None, title=fn, line_label='GT')
+                                wandb.log({"warmup/GT_lineplot": wandb.Image(fig_gt)})
+                                plt.close(fig_gt)
                             all_samples_list = list(map(lambda n: self.ema.sample(label=test_label, age=test_age, batch_size=self.test_size), batches))
                         all_samples = torch.cat(all_samples_list, dim = 0)  # torch.Size([205, 148])
                         wd, js, rmse = self.metrics(all_samples, test_x.squeeze())     
@@ -1272,12 +1367,19 @@ class Trainer1D(object):
                         if wd != None:
                             fn = 'warmup_sample-' + str(milestone) + '_' + str(round(wd, 3)) + '_' + str(round(js, 3)) + '_' + str(round(rmse, 3)) + '.png'
                             torch.save(all_samples, os.path.join(self.results_folder, fn))
-                            image = wandb.Image(all_samples[0].unsqueeze(0), caption=fn, file_type="png") ## visualize first data
+                            pred0 = all_samples[0]
+                            chw = curve_tensor_to_wandb_chw(pred0)
+                            image = wandb.Image(chw, caption=fn, file_type="png")
                             wandb.run.log({fn: [image]})
-                            wandb.log({"warm-up WD": round(wd, 5),
-                                    "warm-up JSD": round(js, 5),
-                                    "warm-up RMSE": round(rmse, 5)
-                                    })  
+                            gt0 = _gt_for_curve_plot(pred0, test_x[0])
+                            fig_s = make_curve_lineplot_figure(pred0, gt=gt0, title=fn, line_label='sample')
+                            wandb.log({
+                                fn + '_lineplot': wandb.Image(fig_s),
+                                "warm-up WD": round(wd, 5),
+                                "warm-up JSD": round(js, 5),
+                                "warm-up RMSE": round(rmse, 5)
+                            })
+                            plt.close(fig_s)  
 
                             if rmse < rmse_min:
                                 rmse_min = rmse
@@ -1342,7 +1444,7 @@ class Trainer1D(object):
             '''Warm-up for learning initial visit'''
             self.run_warmup(accelerator)
         else:
-            pth = os.path.join('warmup_RDM.pt')
+            pth = os.path.join('/home/nvidia-lab/ai4life/thaind2/brain/ConDOR-ICLR25/ConDOR/ct/results/April13_22_57_23/warmup_RDM-163_2.037_0.006_0.401.pt')
             self.load(pth) 
             curr_lr = self.opt.param_groups[0]['lr']
             print('init lr: ', curr_lr)
@@ -1404,8 +1506,12 @@ class Trainer1D(object):
                                 if milestone == 1:
                                     fn = 'GT.png'
                                     torch.save(test_x, os.path.join(self.results_folder, fn))
-                                    image = wandb.Image(test_x[0].unsqueeze(0), caption=fn, file_type="png") ## visualize first data ##########
+                                    chw = curve_tensor_to_wandb_chw(test_x[0])
+                                    image = wandb.Image(chw, caption=fn, file_type="png")
                                     wandb.run.log({"test sample": [image]})
+                                    fig_gt = make_curve_lineplot_figure(test_x[0], gt=None, title=fn, line_label='GT')
+                                    wandb.log({"train/GT_lineplot": wandb.Image(fig_gt)})
+                                    plt.close(fig_gt)
                                 all_samples_list = list(map(lambda n: self.ema.sample_fromv2(label=test_label, age=test_age, batch_size=self.test_size), batches))
 
                             all_samples = torch.cat(all_samples_list, dim=0)
@@ -1416,67 +1522,77 @@ class Trainer1D(object):
                             test_x_flat = rearrange(test_x.squeeze(), 'b v n -> b (v n)')
                             wd, js, rmse = self.metrics(all_samples_flat, test_x_flat)    
 
-                            fn = 'sample-' + str(milestone) + '_' + str(round(wd, 3)) + '_' + str(round(js, 3)) + '_' + str(round(rmse, 3)) + '.png'
-                            torch.save(all_samples, os.path.join(self.results_folder, fn))
-                            image = wandb.Image(all_samples[0].unsqueeze(0), caption=fn, file_type="png") ## visualize first data
-                            wandb.run.log({fn: [image]})
-                            wandb.log({"WD": round(wd, 5),
+                            if wd is not None:
+                                fn = 'sample-' + str(milestone) + '_' + str(round(wd, 3)) + '_' + str(round(js, 3)) + '_' + str(round(rmse, 3)) + '.png'
+                                torch.save(all_samples, os.path.join(self.results_folder, fn))
+                                pred0 = all_samples[0]
+                                chw = curve_tensor_to_wandb_chw(pred0)
+                                image = wandb.Image(chw, caption=fn, file_type="png")
+                                wandb.run.log({fn: [image]})
+                                gt0 = _gt_for_curve_plot(pred0, test_x[0])
+                                fig_s = make_curve_lineplot_figure(pred0, gt=gt0, title=fn, line_label='sample')
+                                wandb.log({
+                                    fn + '_lineplot': wandb.Image(fig_s),
+                                    "WD": round(wd, 5),
                                     "JSD": round(js, 5),
                                     "RMSE": round(rmse, 5)
-                                    })  
+                                })
+                                plt.close(fig_s)
 
-                            if rmse < rmse_min:
-                                rmse_min = rmse
-                                rmse_jsd_min = js
-                                rmse_wd_min = wd
-                                best_rmse_results = {
-                                    "best_rmse": rmse,
-                                    "best_rmse_wd": wd,
-                                    "best_rmse_jsd" : js
-                                }
-                                wandb.config.update(best_rmse_results, allow_val_change=True)
-                                
-                                if wd < 10:
-                                    fn = 'best_model-' + str(milestone) + '_' + str(round(rmse_wd_min, 3)) + '_' + str(round(rmse_jsd_min, 3)) + '_' + str(round(rmse_min, 3)) + '.pt'
-                                    pth = os.path.join(self.results_folder, fn)
-                                    self.save(pth)
-                                    fn = 'best_sample-' + str(milestone) + '_' + str(round(wd, 3)) + '_' + str(round(js, 3)) + '_' + str(round(rmse, 3)) + '.pt'
-                                    torch.save(all_samples, os.path.join(self.results_folder, fn))
-                            
-                            if js < jsd_min:
-                                jsd_min = js
-                                jsd_rmse_min = rmse
-                                jsd_wd_min = wd
-                                best_jsd_results = {
-                                    "best_jsd_rmse": rmse,
-                                    "best_jsd_wd": wd,
-                                    "best_jsd" : js
-                                }
-                                wandb.config.update(best_jsd_results, allow_val_change=True)
-                        
-                                if wd < 10:
-                                    fn = 'best_model-' + str(milestone) + '_' + str(round(jsd_wd_min, 3)) + '_' + str(round(jsd_min, 3)) + '_' + str(round(jsd_rmse_min, 3)) + '.pt'
-                                    pth = os.path.join(self.results_folder, fn)
-                                    self.save(pth)
-                                    fn = 'best_sample-' + str(milestone) + '_' + str(round(wd, 3)) + '_' + str(round(js, 3)) + '_' + str(round(rmse, 3)) + '.pt'
-                                    torch.save(all_samples, os.path.join(self.results_folder, fn))
+                                if rmse < rmse_min:
+                                    rmse_min = rmse
+                                    rmse_jsd_min = js
+                                    rmse_wd_min = wd
+                                    best_rmse_results = {
+                                        "best_rmse": rmse,
+                                        "best_rmse_wd": wd,
+                                        "best_rmse_jsd" : js
+                                    }
+                                    wandb.config.update(best_rmse_results, allow_val_change=True)
 
-                            if wd < wd_min:
-                                wd_min = wd
-                                wd_jsd_min = js
-                                wd_rmse_min = rmse
-                                best_wd_results = {
-                                    "best_jsd_rmse": rmse,
-                                    "best_jsd_wd": wd,
-                                    "best_jsd" : js
-                                }
-                                wandb.config.update(best_wd_results, allow_val_change=True)
-                                if wd < 10:
-                                    fn = 'best_model-' + str(milestone) + '_' + str(round(wd_min, 3)) + '_' + str(round(wd_jsd_min, 3)) + '_' + str(round(wd_rmse_min, 3)) + '.pt'
-                                    pth = os.path.join(self.results_folder, fn)
-                                    self.save(pth)
-                                    fn = 'best_sample-' + str(milestone) + '_' + str(round(wd, 3)) + '_' + str(round(js, 3)) + '_' + str(round(rmse, 3)) + '.pt'
-                                    torch.save(all_samples, os.path.join(self.results_folder, fn))
+                                    if wd < 10:
+                                        fn = 'best_model-' + str(milestone) + '_' + str(round(rmse_wd_min, 3)) + '_' + str(round(rmse_jsd_min, 3)) + '_' + str(round(rmse_min, 3)) + '.pt'
+                                        pth = os.path.join(self.results_folder, fn)
+                                        self.save(pth)
+                                        fn = 'best_sample-' + str(milestone) + '_' + str(round(wd, 3)) + '_' + str(round(js, 3)) + '_' + str(round(rmse, 3)) + '.pt'
+                                        torch.save(all_samples, os.path.join(self.results_folder, fn))
+
+                                if js < jsd_min:
+                                    jsd_min = js
+                                    jsd_rmse_min = rmse
+                                    jsd_wd_min = wd
+                                    best_jsd_results = {
+                                        "best_jsd_rmse": rmse,
+                                        "best_jsd_wd": wd,
+                                        "best_jsd" : js
+                                    }
+                                    wandb.config.update(best_jsd_results, allow_val_change=True)
+
+                                    if wd < 10:
+                                        fn = 'best_model-' + str(milestone) + '_' + str(round(jsd_wd_min, 3)) + '_' + str(round(jsd_min, 3)) + '_' + str(round(jsd_rmse_min, 3)) + '.pt'
+                                        pth = os.path.join(self.results_folder, fn)
+                                        self.save(pth)
+                                        fn = 'best_sample-' + str(milestone) + '_' + str(round(wd, 3)) + '_' + str(round(js, 3)) + '_' + str(round(rmse, 3)) + '.pt'
+                                        torch.save(all_samples, os.path.join(self.results_folder, fn))
+
+                                if wd < wd_min:
+                                    wd_min = wd
+                                    wd_jsd_min = js
+                                    wd_rmse_min = rmse
+                                    best_wd_results = {
+                                        "best_jsd_rmse": rmse,
+                                        "best_jsd_wd": wd,
+                                        "best_jsd" : js
+                                    }
+                                    wandb.config.update(best_wd_results, allow_val_change=True)
+                                    if wd < 10:
+                                        fn = 'best_model-' + str(milestone) + '_' + str(round(wd_min, 3)) + '_' + str(round(wd_jsd_min, 3)) + '_' + str(round(wd_rmse_min, 3)) + '.pt'
+                                        pth = os.path.join(self.results_folder, fn)
+                                        self.save(pth)
+                                        fn = 'best_sample-' + str(milestone) + '_' + str(round(wd, 3)) + '_' + str(round(js, 3)) + '_' + str(round(rmse, 3)) + '.pt'
+                                        torch.save(all_samples, os.path.join(self.results_folder, fn))
+                            else:
+                                wandb.log({"sample_exploded": 1})
 
                     if total_loss < loss_min:
                         loss_min = total_loss

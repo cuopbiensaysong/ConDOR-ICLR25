@@ -1,0 +1,13 @@
+ConDOR/ct/data.csv
+ConDOR/ct/_condor_export_smoke/*
+*.pt
+*.png
+*.csv
+keys.yaml
+*.wandb
+*/wandb/*
+*.json 
+*.log
+ConDOR/ct/wandb/*
+ConDOR/ct/results/*
+ConDOR/ct/data/*

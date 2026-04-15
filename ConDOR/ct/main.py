@@ -1,4 +1,5 @@
 import os
+os.environ['WANDB_API_KEY'] = '9ab49432fdba1dc80b8e9b71d7faca7e8b324e3e'
 import sys
 import time
 import wandb
@@ -34,12 +35,13 @@ def run(args, current_time):
         dim_mults = (1, 2, 4, 8),
         channels = 1,
         n_classes = args.classes,
-        max_visit = max_visit
+        max_visit = max_visit,
+        num_node = int(args.num_node),
     )
 
     diffusion = GaussianDiffusion1D(
         model,
-        num_node = args.num_node,
+        num_node = int(args.num_node),
         timesteps = args.timesteps,
         objective = 'pred_noise',
         norm_min = args.data_min,
@@ -87,15 +89,22 @@ if __name__ == '__main__':
     parser.add_argument('--sampling_epoch', type=int, default=50) 
     parser.add_argument('--lr', type=float, default=0.001)
     parser.add_argument('--optim', type=str, default='Adam') 
-    parser.add_argument('--num_node', type=str, default=148) 
-    parser.add_argument('--seed', type=int, default=0)
+    # parser.add_argument('--num_node', type=str, default=148)
+    parser.add_argument('--num_node', type=int, default=68)
+    parser.add_argument('--seed', type=int, default=10)
     parser.add_argument('--classes', type=int, default=5)
     parser.add_argument('--start_time', type=float, default=time.time(), help='start time of training')
 
     '''Cortical Thickness'''
     parser.add_argument('--dataset', type=str, default='CT') 
     parser.add_argument('--alpha', type=float, default=0.1, help='weight of cohort-level noise, range: (0, 1)')
-    parser.add_argument('--dir', type=str, default='/home/user9/Condor/data/CT') 
+    parser.add_argument('--dir', type=str, default='/home/user9/Condor/data/CT')
+    parser.add_argument(
+        '--ct_csv',
+        type=str,
+        default=None,
+        help='CSV for ordinal regression (default: CT_train.csv under --dir, else CT.csv)',
+    )
     parser.add_argument('--data_min', type=float, default=1.027, help='minimum value of CT')
     parser.add_argument('--data_max', type=float, default=4.81, help='maximum value of CT')
     parser.add_argument('--age_min', type=float, default=55.0, help='minimum value of CT age')
@@ -114,7 +123,12 @@ if __name__ == '__main__':
 
     wandb.init(project="Condor", allow_val_change=True)    
     wandb.run.name = current_time 
-    wandb.run.save() 
+    try:
+        # wandb>=0.25 requires a glob pattern argument for Run.save().
+        wandb.run.save("*.py")
+    except TypeError:
+        # Backward compatibility for older wandb versions.
+        wandb.run.save()
     wandb.config.update(args)
 
     start = args.start_time

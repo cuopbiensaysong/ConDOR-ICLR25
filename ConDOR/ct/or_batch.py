@@ -1,4 +1,7 @@
 import os
+import warnings
+from typing import Optional
+
 import pandas as pd
 import numpy as np
 import torch
@@ -8,16 +11,47 @@ import matplotlib.pyplot as plt
 from einops import rearrange, reduce, repeat
 from statsmodels.miscmodels.ordinal_model import OrderedModel
 
+def _resolve_ct_csv_path(data_dir: str, override: Optional[str] = None) -> str:
+    """Prefer CT_train.csv (no val/test leakage); fall back to legacy CT.csv."""
+    if override:
+        path = override if os.path.isabs(override) else os.path.join(data_dir, override)
+        if os.path.isfile(path):
+            return path
+        raise FileNotFoundError("ct_csv not found: %r" % path)
+    train_path = os.path.join(data_dir, "CT_train.csv")
+    legacy_path = os.path.join(data_dir, "CT.csv")
+    if os.path.isfile(train_path):
+        return train_path
+    if os.path.isfile(legacy_path):
+        warnings.warn(
+            "Using pooled CT.csv; prefer export_condor_from_csv output with CT_train.csv for ordinal regression.",
+            UserWarning,
+            stacklevel=2,
+        )
+        return legacy_path
+    raise FileNotFoundError(
+        "No CT_train.csv or CT.csv in %r (expected ConDOR export layout)." % data_dir
+    )
+
+
 class OrdinalRegression():
     def __init__(self, args):
-        self.df = pd.read_csv(os.path.join(args.dir, 'CT.csv'))
+        ct_path = _resolve_ct_csv_path(args.dir, getattr(args, "ct_csv", None))
+        self.df = pd.read_csv(ct_path)
         self.age = self.df['age']
         self.label = self.df['label']
-        self.data = self.df.iloc[:, -148:]
-        self.data = round(self.data, 4) 
-        self.x_columns = ['Node ' + str(i) for i in range(1, 149)]
+        num_node = int(args.num_node)
+        self.x_columns = ['Node ' + str(i) for i in range(1, num_node + 1)]
+        missing = [c for c in self.x_columns if c not in self.df.columns]
+        if missing:
+            raise ValueError(
+                'CT export missing expected region columns (e.g. Node 1..N): ' + ', '.join(missing[:5])
+                + (' ...' if len(missing) > 5 else '')
+            )
+        self.data = self.df[self.x_columns].copy()
+        self.data = round(self.data, 4)
         self.a_tol = args.age_tolerance
-        self.num_node = args.num_node
+        self.num_node = num_node
         self.args = args
         self.df['age_norm'] = (self.df['age']- args.age_min) / (args.age_max - args.age_min)
         self.age = self.df['age_norm']

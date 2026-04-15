@@ -27,6 +27,7 @@ def run(args, current_time):
     print("# test data: ", len(test_dataset))
     max_visit = train_dataset.max_visit()
     
+    
 
     '''model initialization'''
     model = Unet1D(
